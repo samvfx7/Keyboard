@@ -1,0 +1,8 @@
+<resources>
+    <string name="app_name">AetherKey</string>
+    <string name="keyboard_name">AetherKey Privacy Keyboard</string>
+    <string name="subtype_en">English (US)</string>
+    <string name="subtype_es">Spanish (ES)</string>
+    <string name="subtype_fr">French (FR)</string>
+    <string name="subtype_de">German (DE)</string>
+</resources>

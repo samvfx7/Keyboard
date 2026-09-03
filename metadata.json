@@ -1,0 +1,6 @@
+{
+  "name": "AetherKey",
+  "description": "Privacy-first Android AI Keyboard with adaptive hitboxes, local prediction, and custom AMOLED theme.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
