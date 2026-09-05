@@ -1,17 +1,13 @@
 package com.example.keyboard
 
-import android.content.Intent
+import android.content.res.Configuration
 import android.inputmethodservice.InputMethodService
-import android.text.InputType
+import android.util.Log
 import android.view.KeyEvent
 import android.view.View
 import android.view.inputmethod.EditorInfo
-import android.view.inputmethod.ExtractedTextRequest
-import androidx.compose.runtime.collectAsState
-import androidx.compose.runtime.getValue
-import androidx.compose.runtime.mutableStateOf
-import androidx.compose.runtime.setValue
 import androidx.compose.ui.platform.ComposeView
+import androidx.compose.ui.platform.ViewCompositionStrategy
 import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.LifecycleOwner
 import androidx.lifecycle.LifecycleRegistry
@@ -23,33 +19,22 @@ import androidx.savedstate.SavedStateRegistry
 import androidx.savedstate.SavedStateRegistryController
 import androidx.savedstate.SavedStateRegistryOwner
 import androidx.savedstate.setViewTreeSavedStateRegistryOwner
-import com.example.MainActivity
-import com.example.data.db.AetherDatabase
-import com.example.data.preferences.KeyboardPreferences
-import com.example.keyboard.engine.AdaptiveHitboxEngine
-import com.example.keyboard.engine.AutocorrectEngine
-import com.example.keyboard.engine.ClipboardManagerEngine
-import com.example.keyboard.engine.EmojiEngine
-import com.example.keyboard.engine.KeyPosition
-import com.example.keyboard.engine.LanguageEngine
-import com.example.keyboard.engine.PredictionEngine
-import com.example.keyboard.engine.PredictionResult
-import com.example.keyboard.engine.SwipeTypingEngine
-import com.example.keyboard.engine.TouchPoint
-import com.example.keyboard.ui.KeyboardScreen
-import kotlinx.coroutines.CoroutineScope
-import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.SupervisorJob
-import kotlinx.coroutines.cancel
-import kotlinx.coroutines.launch
-import kotlinx.coroutines.withContext
+import com.example.keyboard.ui.MinimalKeyboardScreen
 
+/**
+ * Genuine Android InputMethodService implementation for AetherKey.
+ * Adheres strictly to the Android IME lifecycle with robust lifecycle registration,
+ * Compose ViewTree owners, and defensive error handling.
+ */
 class AetherKeyboardService : InputMethodService(),
     LifecycleOwner,
     ViewModelStoreOwner,
     SavedStateRegistryOwner {
 
-    private val serviceScope = CoroutineScope(SupervisorJob() + Dispatchers.Main)
+    companion object {
+        private const val TAG = "AetherKeyboardService"
+    }
+
     private val lifecycleRegistry = LifecycleRegistry(this)
     private val store = ViewModelStore()
     private val savedStateRegistryController = SavedStateRegistryController.create(this)
@@ -58,328 +43,199 @@ class AetherKeyboardService : InputMethodService(),
     override val viewModelStore: ViewModelStore get() = store
     override val savedStateRegistry: SavedStateRegistry get() = savedStateRegistryController.savedStateRegistry
 
-    private lateinit var database: AetherDatabase
-    private lateinit var prefs: KeyboardPreferences
-    private lateinit var languageEngine: LanguageEngine
-    private lateinit var autocorrectEngine: AutocorrectEngine
-    private lateinit var adaptiveHitboxEngine: AdaptiveHitboxEngine
-    private lateinit var predictionEngine: PredictionEngine
-    private lateinit var swipeTypingEngine: SwipeTypingEngine
-    private lateinit var emojiEngine: EmojiEngine
-    private lateinit var clipboardEngine: ClipboardManagerEngine
-
-    private var currentWordBuffer by mutableStateOf("")
-    private var predictionResult by mutableStateOf(PredictionResult("", emptyList()))
-    private var isPasswordMode by mutableStateOf(false)
-    private var isNumericMode by mutableStateOf(false)
-
-    private val keyPositionsMap = mutableListOf<KeyPosition>()
-    private var lastSpaceTime = 0L
-
     override fun onCreate() {
+        Log.i(TAG, "onCreate: Initializing AetherKeyboardService")
         super.onCreate()
-        savedStateRegistryController.performRestore(null)
-        lifecycleRegistry.handleLifecycleEvent(Lifecycle.Event.ON_CREATE)
-
-        database = AetherDatabase.getInstance(this)
-        prefs = KeyboardPreferences(this)
-        languageEngine = LanguageEngine()
-        autocorrectEngine = AutocorrectEngine(languageEngine)
-        adaptiveHitboxEngine = AdaptiveHitboxEngine(database.aetherDao(), serviceScope)
-        emojiEngine = EmojiEngine()
-        predictionEngine = PredictionEngine(database.aetherDao(), languageEngine, emojiEngine, autocorrectEngine, serviceScope)
-        swipeTypingEngine = SwipeTypingEngine(languageEngine)
-        clipboardEngine = ClipboardManagerEngine(this, database.aetherDao(), serviceScope)
+        try {
+            savedStateRegistryController.performAttach()
+            savedStateRegistryController.performRestore(null)
+            lifecycleRegistry.handleLifecycleEvent(Lifecycle.Event.ON_CREATE)
+            Log.d(TAG, "onCreate: Lifecycle initialized successfully to ON_CREATE")
+        } catch (e: Exception) {
+            Log.e(TAG, "onCreate: Exception during lifecycle initialization", e)
+        }
     }
 
     override fun onCreateInputView(): View {
-        lifecycleRegistry.handleLifecycleEvent(Lifecycle.Event.ON_START)
-        lifecycleRegistry.handleLifecycleEvent(Lifecycle.Event.ON_RESUME)
+        Log.i(TAG, "onCreateInputView: Creating Compose input view")
+        try {
+            if (lifecycleRegistry.currentState < Lifecycle.State.CREATED) {
+                lifecycleRegistry.handleLifecycleEvent(Lifecycle.Event.ON_CREATE)
+            }
+            if (lifecycleRegistry.currentState < Lifecycle.State.STARTED) {
+                lifecycleRegistry.handleLifecycleEvent(Lifecycle.Event.ON_START)
+            }
+            if (lifecycleRegistry.currentState < Lifecycle.State.RESUMED) {
+                lifecycleRegistry.handleLifecycleEvent(Lifecycle.Event.ON_RESUME)
+            }
+        } catch (e: Exception) {
+            Log.e(TAG, "onCreateInputView: Error setting lifecycle state", e)
+        }
 
-        val composeView = ComposeView(this)
-        composeView.setViewTreeLifecycleOwner(this)
-        composeView.setViewTreeViewModelStoreOwner(this)
-        composeView.setViewTreeSavedStateRegistryOwner(this)
+        val composeView = ComposeView(this).apply {
+            // Keep composition alive across keyboard show/hide cycles
+            setViewCompositionStrategy(ViewCompositionStrategy.DisposeOnViewTreeLifecycleDestroyed)
+            setViewTreeLifecycleOwner(this@AetherKeyboardService)
+            setViewTreeViewModelStoreOwner(this@AetherKeyboardService)
+            setViewTreeSavedStateRegistryOwner(this@AetherKeyboardService)
+        }
 
         composeView.setContent {
-            val lang by prefs.currentLanguage.collectAsState()
-            val mixedMode by prefs.mixedLanguageMode.collectAsState()
-
-            KeyboardScreen(
-                prefs = prefs,
-                predictionResult = predictionResult,
-                emojiEngine = emojiEngine,
-                clipboardEngine = clipboardEngine,
-                isPasswordMode = isPasswordMode,
-                isNumericMode = isNumericMode,
-                onKeyChar = { char, rx, ry -> handleKeyChar(char, rx, ry) },
+            MinimalKeyboardScreen(
+                onKeyChar = { char -> handleKeyChar(char) },
                 onBackspace = { handleBackspace() },
                 onSpace = { handleSpace() },
-                onEnter = { handleEnter() },
-                onSuggestionSelected = { word -> handleSuggestionSelected(word) },
-                onEmojiSelected = { emoji -> currentInputConnection?.commitText(emoji, 1) },
-                onMoveCursor = { dx, dy -> handleMoveCursor(dx, dy) },
-                onSwipePathCompleted = { path -> handleSwipeCompleted(path) },
-                onSelectAll = { currentInputConnection?.performContextMenuAction(android.R.id.selectAll) },
-                onSelectWord = { handleSelectWord() },
-                onCut = { currentInputConnection?.performContextMenuAction(android.R.id.cut) },
-                onCopy = { currentInputConnection?.performContextMenuAction(android.R.id.copy) },
-                onPaste = { currentInputConnection?.performContextMenuAction(android.R.id.paste) },
-                onUndo = { currentInputConnection?.sendKeyEvent(KeyEvent(KeyEvent.ACTION_DOWN, KeyEvent.KEYCODE_Z)) },
-                onRedo = { currentInputConnection?.sendKeyEvent(KeyEvent(KeyEvent.ACTION_DOWN, KeyEvent.KEYCODE_Y)) },
-                onOpenSettings = {
-                    val intent = Intent(this, MainActivity::class.java).apply {
-                        flags = Intent.FLAG_ACTIVITY_NEW_TASK
-                    }
-                    startActivity(intent)
-                },
-                onToggleLanguage = {
-                    val nextLang = when (lang) {
-                        "en" -> "es"
-                        "es" -> "fr"
-                        "fr" -> "de"
-                        else -> "en"
-                    }
-                    prefs.setCurrentLanguage(nextLang)
-                },
-                onReportKeyPosition = { keyPos ->
-                    keyPositionsMap.removeAll { it.char.lowercaseChar() == keyPos.char.lowercaseChar() }
-                    keyPositionsMap.add(keyPos)
-                }
+                onEnter = { handleEnter() }
             )
         }
         return composeView
     }
 
-    override fun onStartInputView(info: EditorInfo?, restarting: Boolean) {
-        super.onStartInputView(info, restarting)
-        if (info == null) return
-
-        val variation = info.inputType and InputType.TYPE_MASK_VARIATION
-        val clazz = info.inputType and InputType.TYPE_MASK_CLASS
-
-        // Detect Privacy-Sensitive Password Fields
-        isPasswordMode = (variation == InputType.TYPE_TEXT_VARIATION_PASSWORD ||
-                variation == InputType.TYPE_TEXT_VARIATION_VISIBLE_PASSWORD ||
-                variation == InputType.TYPE_TEXT_VARIATION_WEB_PASSWORD)
-
-        // Detect Numeric Fields
-        isNumericMode = (clazz == InputType.TYPE_CLASS_NUMBER ||
-                clazz == InputType.TYPE_CLASS_PHONE ||
-                clazz == InputType.TYPE_CLASS_DATETIME)
-
-        currentWordBuffer = ""
-        predictionResult = PredictionResult("", emptyList())
-        autocorrectEngine.clearUndo()
+    override fun onStartInput(attribute: EditorInfo?, restarting: Boolean) {
+        super.onStartInput(attribute, restarting)
+        Log.d(TAG, "onStartInput: inputType=${attribute?.inputType}, restarting=$restarting")
     }
 
-    private fun handleKeyChar(char: Char, rawX: Float, rawY: Float) {
-        val ic = currentInputConnection ?: return
+    override fun onStartInputView(info: EditorInfo?, restarting: Boolean) {
+        super.onStartInputView(info, restarting)
+        Log.d(TAG, "onStartInputView: inputType=${info?.inputType}, imeOptions=${info?.imeOptions}, restarting=$restarting")
+    }
 
-        // 1. Commit character to text field
-        ic.commitText(char.toString(), 1)
+    override fun onFinishInputView(finishingInput: Boolean) {
+        super.onFinishInputView(finishingInput)
+        Log.d(TAG, "onFinishInputView: finishingInput=$finishingInput")
+    }
 
-        // 2. Calibrate adaptive touch hitboxes if key location exists
-        val matchingKey = keyPositionsMap.find { it.char.lowercaseChar() == char.lowercaseChar() }
-        if (matchingKey != null) {
-            adaptiveHitboxEngine.learnTouchOffset(char, rawX, rawY, matchingKey)
-        }
+    override fun onFinishInput() {
+        super.onFinishInput()
+        Log.d(TAG, "onFinishInput")
+    }
 
-        // 3. Update current word buffer & trigger predictions
-        currentWordBuffer += char
-
-        // Check text snippet shortcut (e.g. "/email")
-        if (currentWordBuffer.startsWith("/")) {
-            serviceScope.launch {
-                val expansion = clipboardEngine.checkSnippetExpansion(currentWordBuffer)
-                if (expansion != null) {
-                    ic.deleteSurroundingText(currentWordBuffer.length, 0)
-                    ic.commitText(expansion, 1)
-                    currentWordBuffer = ""
-                }
+    override fun onWindowShown() {
+        super.onWindowShown()
+        Log.d(TAG, "onWindowShown: Keyboard window is now visible")
+        try {
+            if (lifecycleRegistry.currentState < Lifecycle.State.STARTED) {
+                lifecycleRegistry.handleLifecycleEvent(Lifecycle.Event.ON_START)
             }
+            if (lifecycleRegistry.currentState < Lifecycle.State.RESUMED) {
+                lifecycleRegistry.handleLifecycleEvent(Lifecycle.Event.ON_RESUME)
+            }
+        } catch (e: Exception) {
+            Log.e(TAG, "onWindowShown: Error updating lifecycle", e)
         }
+    }
 
-        updatePredictions()
+    override fun onWindowHidden() {
+        super.onWindowHidden()
+        Log.d(TAG, "onWindowHidden: Keyboard window is hidden")
+        try {
+            if (lifecycleRegistry.currentState >= Lifecycle.State.RESUMED) {
+                lifecycleRegistry.handleLifecycleEvent(Lifecycle.Event.ON_PAUSE)
+            }
+        } catch (e: Exception) {
+            Log.e(TAG, "onWindowHidden: Error updating lifecycle", e)
+        }
+    }
+
+    override fun onConfigurationChanged(newConfig: Configuration) {
+        super.onConfigurationChanged(newConfig)
+        Log.d(TAG, "onConfigurationChanged: orientation=${newConfig.orientation}")
+    }
+
+    private fun handleKeyChar(char: Char) {
+        try {
+            val ic = currentInputConnection
+            if (ic == null) {
+                Log.w(TAG, "handleKeyChar: currentInputConnection is null, cannot commit '$char'")
+                return
+            }
+            Log.d(TAG, "handleKeyChar: Committing character '$char'")
+            ic.commitText(char.toString(), 1)
+        } catch (e: Exception) {
+            Log.e(TAG, "handleKeyChar: Exception committing '$char'", e)
+        }
     }
 
     private fun handleBackspace() {
-        val ic = currentInputConnection ?: return
-
-        // Check if user is undoing an immediate autocorrect
-        val currentText = ic.getTextBeforeCursor(30, 0)?.toString() ?: ""
-        val reverted = autocorrectEngine.undoLastCorrection(currentText)
-
-        if (reverted != null) {
-            ic.deleteSurroundingText(currentText.length, 0)
-            ic.commitText(reverted, 1)
-            currentWordBuffer = reverted.split("\\s+".toRegex()).lastOrNull() ?: ""
-            updatePredictions()
-            return
+        try {
+            val ic = currentInputConnection
+            if (ic == null) {
+                Log.w(TAG, "handleBackspace: currentInputConnection is null")
+                return
+            }
+            Log.d(TAG, "handleBackspace: Deleting character or active selection")
+            val selectedText = ic.getSelectedText(0)
+            if (!selectedText.isNullOrEmpty()) {
+                ic.commitText("", 1)
+            } else {
+                val deleted = ic.deleteSurroundingText(1, 0)
+                if (!deleted) {
+                    sendDownUpKeyEvents(KeyEvent.KEYCODE_DEL)
+                }
+            }
+        } catch (e: Exception) {
+            Log.e(TAG, "handleBackspace: Exception during backspace", e)
+            try {
+                sendDownUpKeyEvents(KeyEvent.KEYCODE_DEL)
+            } catch (ignored: Exception) {}
         }
-
-        if (currentWordBuffer.isNotEmpty()) {
-            currentWordBuffer = currentWordBuffer.dropLast(1)
-        }
-
-        ic.deleteSurroundingText(1, 0)
-        updatePredictions()
     }
 
     private fun handleSpace() {
-        val ic = currentInputConnection ?: return
-        val now = System.currentTimeMillis()
-
-        // Double Space Period Insertion
-        if (now - lastSpaceTime < 350 && currentWordBuffer.isEmpty()) {
-            ic.deleteSurroundingText(1, 0)
-            ic.commitText(". ", 1)
-            lastSpaceTime = 0
-            return
-        }
-        lastSpaceTime = now
-
-        // Check Autocorrect Confidence
-        if (!isPasswordMode && prefs.autocorrectEnabled.value && currentWordBuffer.isNotEmpty()) {
-            val candidate = predictionResult.mainSuggestion
-            val autoCorrection = autocorrectEngine.evaluateAutocorrect(
-                typedWord = currentWordBuffer,
-                candidateWords = listOf(candidate) + predictionResult.alternativeSuggestions,
-                personalLearnedWords = predictionEngine.getPersonalWords(),
-                lang = prefs.currentLanguage.value,
-                sensitivity = prefs.autocorrectSensitivity.value,
-                isPasswordOrCode = isPasswordMode
-            )
-
-            if (autoCorrection != null && autoCorrection != currentWordBuffer) {
-                ic.deleteSurroundingText(currentWordBuffer.length, 0)
-                ic.commitText("$autoCorrection ", 1)
-
-                if (prefs.personalLearningEnabled.value) {
-                    predictionEngine.learnInput(autoCorrection, null, prefs.currentLanguage.value)
-                }
-                currentWordBuffer = ""
-                updatePredictions()
+        try {
+            val ic = currentInputConnection
+            if (ic == null) {
+                Log.w(TAG, "handleSpace: currentInputConnection is null")
                 return
             }
+            Log.d(TAG, "handleSpace: Committing space")
+            ic.commitText(" ", 1)
+        } catch (e: Exception) {
+            Log.e(TAG, "handleSpace: Exception committing space", e)
         }
-
-        if (currentWordBuffer.isNotEmpty() && prefs.personalLearningEnabled.value) {
-            predictionEngine.learnInput(currentWordBuffer, null, prefs.currentLanguage.value)
-        }
-
-        ic.commitText(" ", 1)
-        currentWordBuffer = ""
-        updatePredictions()
     }
 
     private fun handleEnter() {
-        val ic = currentInputConnection ?: return
-        val info = currentInputEditorInfo
-
-        if (info != null && info.actionId != 0) {
-            ic.performEditorAction(info.actionId)
-        } else {
-            ic.sendKeyEvent(KeyEvent(KeyEvent.ACTION_DOWN, KeyEvent.KEYCODE_ENTER))
-            ic.sendKeyEvent(KeyEvent(KeyEvent.ACTION_UP, KeyEvent.KEYCODE_ENTER))
-        }
-        currentWordBuffer = ""
-    }
-
-    private fun handleSuggestionSelected(word: String) {
-        val ic = currentInputConnection ?: return
-        if (currentWordBuffer.isNotEmpty()) {
-            ic.deleteSurroundingText(currentWordBuffer.length, 0)
-        }
-        ic.commitText("$word ", 1)
-
-        if (prefs.personalLearningEnabled.value) {
-            predictionEngine.learnInput(word, null, prefs.currentLanguage.value)
-        }
-        currentWordBuffer = ""
-        updatePredictions()
-    }
-
-    private fun handleSwipeCompleted(path: List<TouchPoint>) {
-        if (isPasswordMode) return
-        val ic = currentInputConnection ?: return
-
-        val candidates = swipeTypingEngine.decodeSwipePath(
-            pathPoints = path,
-            keyPositions = keyPositionsMap,
-            lang = prefs.currentLanguage.value
-        )
-
-        if (candidates.isNotEmpty()) {
-            val topWord = candidates.first()
-            ic.commitText("$topWord ", 1)
-            if (prefs.personalLearningEnabled.value) {
-                predictionEngine.learnInput(topWord, null, prefs.currentLanguage.value)
+        try {
+            val ic = currentInputConnection
+            if (ic == null) {
+                Log.w(TAG, "handleEnter: currentInputConnection is null")
+                return
             }
-            currentWordBuffer = ""
-            updatePredictions()
-        }
-    }
+            val info = currentInputEditorInfo
+            val action = info?.imeOptions?.and(EditorInfo.IME_MASK_ACTION) ?: EditorInfo.IME_ACTION_NONE
+            Log.d(TAG, "handleEnter: editor action=$action, actionId=${info?.actionId}")
 
-    private fun handleMoveCursor(dx: Int, dy: Int) {
-        val ic = currentInputConnection ?: return
-        val extracted = ic.getExtractedText(ExtractedTextRequest(), 0) ?: return
-        val currentPos = extracted.selectionStart
-
-        val newPos = (currentPos + dx).coerceIn(0, extracted.text.length)
-        ic.setSelection(newPos, newPos)
-    }
-
-    private fun handleSelectWord() {
-        val ic = currentInputConnection ?: return
-        val textBefore = ic.getTextBeforeCursor(50, 0)?.toString() ?: ""
-        val textAfter = ic.getTextAfterCursor(50, 0)?.toString() ?: ""
-
-        val wordBefore = textBefore.takeLastWhile { !it.isWhitespace() }
-        val wordAfter = textAfter.takeWhile { !it.isWhitespace() }
-
-        val start = textBefore.length - wordBefore.length
-        val end = textBefore.length + wordAfter.length
-
-        val extracted = ic.getExtractedText(ExtractedTextRequest(), 0) ?: return
-        ic.setSelection(start.coerceAtLeast(0), end.coerceAtMost(extracted.text.length))
-    }
-
-    private fun updatePredictions() {
-        if (isPasswordMode) {
-            predictionResult = PredictionResult("", emptyList())
-            return
-        }
-
-        val ic = currentInputConnection
-        val fullTextBefore = ic?.getTextBeforeCursor(100, 0)?.toString() ?: ""
-        val words = fullTextBefore.trim().split("\\s+".toRegex()).dropLast(1)
-
-        serviceScope.launch {
-            if (prefs.smartLocalModel.value && fullTextBefore.length > 15) {
-                predictionResult = predictionEngine.getSmartPredictions(
-                    fullSentenceContext = fullTextBefore,
-                    currentWord = currentWordBuffer,
-                    previousWords = words,
-                    lang = prefs.currentLanguage.value,
-                    mixedMode = prefs.mixedLanguageMode.value
-                )
+            if (action != EditorInfo.IME_ACTION_NONE && action != EditorInfo.IME_ACTION_UNSPECIFIED) {
+                val handled = ic.performEditorAction(action)
+                if (!handled) {
+                    sendDownUpKeyEvents(KeyEvent.KEYCODE_ENTER)
+                }
+            } else if (info != null && info.actionId != 0) {
+                val handled = ic.performEditorAction(info.actionId)
+                if (!handled) {
+                    sendDownUpKeyEvents(KeyEvent.KEYCODE_ENTER)
+                }
             } else {
-                predictionResult = predictionEngine.getFastPredictions(
-                    currentWord = currentWordBuffer,
-                    previousWords = words,
-                    lang = prefs.currentLanguage.value,
-                    mixedMode = prefs.mixedLanguageMode.value,
-                    enableNextWord = prefs.nextWordPrediction.value
-                )
+                sendDownUpKeyEvents(KeyEvent.KEYCODE_ENTER)
             }
+        } catch (e: Exception) {
+            Log.e(TAG, "handleEnter: Exception sending enter", e)
+            try {
+                sendDownUpKeyEvents(KeyEvent.KEYCODE_ENTER)
+            } catch (ignored: Exception) {}
         }
     }
 
     override fun onDestroy() {
         super.onDestroy()
-        lifecycleRegistry.handleLifecycleEvent(Lifecycle.Event.ON_DESTROY)
-        store.clear()
-        serviceScope.cancel()
+        Log.i(TAG, "onDestroy: Destroying AetherKeyboardService")
+        try {
+            lifecycleRegistry.handleLifecycleEvent(Lifecycle.Event.ON_DESTROY)
+            store.clear()
+        } catch (e: Exception) {
+            Log.e(TAG, "onDestroy: Exception in destroy lifecycle", e)
+        }
     }
 }
